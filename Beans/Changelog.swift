@@ -43,6 +43,27 @@ enum ChangelogStore {
 
     static let logs: [VersionLog] = [
         VersionLog(
+            id: "1.5.6",
+            version: "1.5.6",
+            title: "蓝牙歌词与第三方音源增强",
+            notices: [
+                "第三方音源需自行在「设置 - 第三方音源」中添加或导入；蓝牙歌词开启后会同步显示在锁屏和控制中心的正在播放信息中。"
+            ],
+            features: [
+                "新增蓝牙歌词模式：按播放进度获取并同步当前歌词到锁屏、控制中心及蓝牙设备显示",
+                "第三方音源支持 JSON 配置和 LX Music .js 音源脚本，可作为官方播放地址不可用时的备用来源",
+                "音源文件导入入口合并，自动识别 JSON 配置或 LX Music .js 脚本",
+                "音源 URL 导入支持远程 LX Music .js 脚本，并自动识别 JSON 与 JS 内容",
+                "增强 LX Music 脚本运行环境和初始化处理，兼容更多需要网络初始化的音源脚本",
+                "更新音源示例配置，新增 GDStudio 无损（br=999）与 oiapi 音源；VIP 歌曲可尝试解析更高音质"
+            ],
+            fixes: [
+                "修正此前对 GDStudio 的错误判断：VIP 歌曲实际可正常解析，此前仅因个别歌曲无版权而误判为整体不支持",
+                "修复第三方播放地址加载失败时没有提示的问题，现在会显示具体失败原因",
+                "修复 LX Music 脚本元数据导入，支持解析 @name、@version、@author、@description 和 @homepage"
+            ]
+        ),
+        VersionLog(
             id: "1.5.5",
             version: "1.5.5",
             title: "播放流畅度与发热优化",

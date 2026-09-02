@@ -981,6 +981,7 @@ struct AccountHubSheet: View {
 
 struct SettingsView: View {
     @EnvironmentObject private var theme: ThemeStore
+    @EnvironmentObject private var player: PlayerManager
     @Environment(\.dismiss) private var dismiss
     @AppStorage("beans.themeMode") private var themeModeRaw = BeansThemeMode.system.rawValue
     /// 音质等级（借鉴 Kumone）
@@ -991,13 +992,14 @@ struct SettingsView: View {
     @AppStorage("beans.legacyTabWidth") private var legacyTabWidth = 356.0
     @AppStorage("beans.legacyTabOffsetX") private var legacyTabOffsetX = 0.0
     @AppStorage("beans.legacyTabOffsetY") private var legacyTabOffsetY = 0.0
-    /// 官方地址不可用时，是否尝试内置音源
+    /// 官方地址不可用时，是否尝试用户配置的第三方音源
     @AppStorage("beans.enableUnblock") private var enableBuiltInSources = true
     /// 第三方音源播放会员歌成功时提醒，默认开启
     @AppStorage("beans.showThirdPartyVIPNotice") private var showThirdPartyVIPNotice = true
     /// 可选高刷新率动效，默认开启；可手动关闭以降低发热
     @AppStorage("beans.enableHighRefresh") private var enableHighRefresh = true
     @AppStorage("beans.audio.mixothers.v1") private var mixesWithOthers = false
+    @AppStorage(PlayerManager.bluetoothLyricsKey) private var bluetoothLyrics = false
     @AppStorage("beans.labelColorHex") private var labelColorHex = ""
     @ObservedObject private var sourceStore = UnblockSourceStore.shared
     @ObservedObject private var platformPrefs = PlatformPreferenceStore.shared
@@ -1022,13 +1024,22 @@ struct SettingsView: View {
     /// 日志
     @State private var showLogViewer = false
     @State private var showUsageGuide = false
+    /// 音源管理页
+    @State private var showSourceManager = false
 
     private var themeMode: BeansThemeMode {
         BeansThemeMode(rawValue: themeModeRaw) ?? .system
     }
 
-    private var presetSourceCount: Int {
-        sourceStore.presetSources.count
+    /// 音源摘要：如实反映没配音源 / 有多少可用 / 有多少异常
+    private var sourceSummary: String {
+        let all = sourceStore.sources
+        guard !all.isEmpty else { return "尚未添加音源，会员/灰色歌曲将无法播放" }
+        let active = sourceStore.activeSources.count
+        let failed = all.filter { sourceStore.healthState(for: $0.id).isFailed }.count
+        var text = "已添加 \(all.count) 个，启用 \(active) 个"
+        if failed > 0 { text += "，\(failed) 个不可用" }
+        return text
     }
 
     var body: some View {
@@ -1096,6 +1107,9 @@ struct SettingsView: View {
         }
         .sheet(isPresented: $showLogViewer) {
             LogViewerSheet(importedText: nil)
+        }
+        .sheet(isPresented: $showSourceManager) {
+            UnblockSourceManagerSheet()
         }
         .fullScreenCover(isPresented: $showRestorePicker) {
             BackupDocumentPicker { url in
@@ -1574,7 +1588,7 @@ struct SettingsView: View {
                         Text("播放设置")
                             .font(BeansFont.appFont(15))
                             .foregroundStyle(Color.beansLabel)
-                        Text("\(BeansAudioQuality(rawValue: audioQualityRaw)?.displayName ?? "高品质") · \(enableBuiltInSources ? "内置音源已开" : "内置音源已关")")
+                        Text("\(BeansAudioQuality(rawValue: audioQualityRaw)?.displayName ?? "高品质") · \(enableBuiltInSources ? "第三方音源已开" : "第三方音源已关") · \(bluetoothLyrics ? "蓝牙歌词已开" : "蓝牙歌词已关")")
                             .font(BeansFont.appFont(11))
                             .foregroundStyle(Color.beansComment)
                             .lineLimit(1)
@@ -1663,17 +1677,17 @@ struct SettingsView: View {
 
                 Divider().overlay(Color.beansComment.opacity(0.15))
 
-                Toggle(isOn: $enableBuiltInSources) {
+                Toggle(isOn: $bluetoothLyrics) {
                     HStack(spacing: 12) {
-                        Image(systemName: "externaldrive.connected.to.line.below")
+                        Image(systemName: "quote.bubble.fill")
                             .font(.system(size: 14))
-                        .foregroundStyle(Color.beansAmber)
-                        .frame(width: 28)
+                            .foregroundStyle(Color.beansAmber)
+                            .frame(width: 28)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("使用内置音源")
+                            Text("蓝牙歌词")
                                 .font(BeansFont.appFont(15))
                                 .foregroundStyle(Color.beansLabel)
-                            Text("仅在官方地址不可用或为试听片段时回退到预设")
+                            Text("开启后锁屏/车机的歌名位置显示当前歌词，歌手位置显示歌名")
                                 .font(BeansFont.appFont(11))
                                 .foregroundStyle(Color.beansComment)
                         }
@@ -1681,6 +1695,32 @@ struct SettingsView: View {
                 }
                 .toggleStyle(.switch)
                 .tint(Color.beansAmber)
+                .onChange(of: bluetoothLyrics) { _ in
+                    player.applyBluetoothLyricsPreference()
+                }
+
+                Divider().overlay(Color.beansComment.opacity(0.15))
+
+                Toggle(isOn: $enableBuiltInSources) {
+                    HStack(spacing: 12) {
+                        Image(systemName: "externaldrive.connected.to.line.below")
+                            .font(.system(size: 14))
+                        .foregroundStyle(Color.beansAmber)
+                        .frame(width: 28)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("使用第三方音源")
+                                .font(BeansFont.appFont(15))
+                                .foregroundStyle(Color.beansLabel)
+                            Text("仅在官方地址不可用或为试听片段时回退到自建音源")
+                                .font(BeansFont.appFont(11))
+                                .foregroundStyle(Color.beansComment)
+                        }
+                    }
+                }
+                .toggleStyle(.switch)
+                .tint(Color.beansAmber)
+
+                Divider().overlay(Color.beansComment.opacity(0.15))
 
                 Toggle(isOn: $showThirdPartyVIPNotice) {
                     HStack(spacing: 12) {
@@ -1692,7 +1732,7 @@ struct SettingsView: View {
                             Text("第三方播放会员歌提醒")
                                 .font(BeansFont.appFont(15))
                                 .foregroundStyle(Color.beansLabel)
-                            Text("未识别到对应会员且会员歌曲通过内置音源播放成功时提示")
+                            Text("未识别到对应会员且会员歌曲通过第三方音源播放成功时提示")
                                 .font(BeansFont.appFont(11))
                                 .foregroundStyle(Color.beansComment)
                         }
@@ -1701,36 +1741,32 @@ struct SettingsView: View {
                 .toggleStyle(.switch)
                 .tint(Color.beansAmber)
 
-                HStack(spacing: 10) {
-                    Image(systemName: "shippingbox.fill")
-                        .font(.system(size: 14))
-                        .foregroundStyle(Color.beansAmber)
-                    Text("内置音源预设")
-                        .font(BeansFont.appFont(13, .semibold))
-                        .foregroundStyle(Color.beansLabel)
-                    Spacer()
-                    Text("\(presetSourceCount) 个")
-                        .font(BeansFont.appFont(12))
-                        .foregroundStyle(Color.beansComment)
-                }
+                Divider().overlay(Color.beansComment.opacity(0.15))
 
-                ForEach(sourceStore.presetSources) { source in
-                    HStack(spacing: 10) {
+                Button {
+                    BeansHaptics.tap()
+                    showSourceManager = true
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "shippingbox.fill")
+                            .font(.system(size: 14))
+                            .foregroundStyle(Color.beansAmber)
+                            .frame(width: 28)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(source.name)
-                                .font(BeansFont.appFont(13, .medium))
+                            Text("音源管理")
+                                .font(BeansFont.appFont(15))
                                 .foregroundStyle(Color.beansLabel)
-                                .lineLimit(1)
-                            Text("内置预设 · \(source.kind.replacingOccurrences(of: "paid-", with: "").uppercased())")
-                                .font(BeansFont.appFont(10))
+                            Text(sourceSummary)
+                                .font(BeansFont.appFont(11))
                                 .foregroundStyle(Color.beansComment)
                         }
                         Spacer()
-                        Toggle("", isOn: sourceEnabledBinding(source.id))
-                            .labelsHidden()
-                            .tint(Color.beansAmber)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(Color.beansComment)
                     }
                 }
+                .buttonStyle(.plain)
 
             }
             .padding(16)
@@ -1741,16 +1777,6 @@ struct SettingsView: View {
             .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
-    }
-
-    private func sourceEnabledBinding(_ id: String) -> Binding<Bool> {
-        Binding(
-            get: { sourceStore.presetSources.first(where: { $0.id == id })?.enabled ?? false },
-            set: { value in
-                guard let index = sourceStore.presetSources.firstIndex(where: { $0.id == id }) else { return }
-                sourceStore.presetSources[index].enabled = value
-            }
-        )
     }
 
     /// 更新日志入口

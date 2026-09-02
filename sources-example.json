@@ -1,0 +1,25 @@
+[
+  {
+    "name": "GDStudio 无损 (网易云)",
+    "template": "https://music-api.gdstudio.xyz/api.php?types=url&source={source}&id={id}&br=999",
+    "urlPath": "url",
+    "providerMap": { "wy": "netease" },
+    "headers": { "br": "999" },
+    "enabled": true
+  },
+  {
+    "name": "GDStudio 320k (网易云)",
+    "template": "https://music-api.gdstudio.xyz/api.php?types=url&source={source}&id={id}&br=320",
+    "urlPath": "url",
+    "providerMap": { "wy": "netease" },
+    "headers": { "br": "320" },
+    "enabled": true
+  },
+  {
+    "name": "oiapi (网易云)",
+    "template": "https://oiapi.net/api/Music_163?id={id}",
+    "urlPath": "data.0.url|data.url|url",
+    "providerMap": { "wy": "netease" },
+    "enabled": true
+  }
+]

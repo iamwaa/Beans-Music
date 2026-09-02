@@ -85,13 +85,21 @@ final class PlayerManager: NSObject, ObservableObject {
     private var lastCountedSongID: String?
     private var wasPlayingBeforeInterruption = false
     private var lastPublishedProgress: Double = -1
+    /// 锁屏封面：当前歌曲的封面标识与已加载的封面。
+    /// 用强引用而非 NSCache，避免 App 进入后台后被系统回收，刷新锁屏信息时丢失封面。
     private var lastNowPlayingArtworkKey: String?
-    private static let nowPlayingArtworkCache = NSCache<NSURL, UIImage>()
+    private var nowPlayingArtwork: MPMediaItemArtwork?
+
+    /// 蓝牙歌词：当前歌曲歌词、歌词归属歌曲、已推送到锁屏的歌词文案
+    private var bluetoothLyrics: [LyricLine] = []
+    private var bluetoothLyricsSongKey: String?
+    private var pushedLyricText: String?
 
     private let historyKey = "beans.history"
     private let countsKey = "beans.playcounts"
     private let audioMixKey = "beans.audio.mixothers.v1"
     private let thirdPartyVIPNoticeKey = "beans.showThirdPartyVIPNotice"
+    static let bluetoothLyricsKey = "beans.bluetoothLyrics"
     private let defaults = UserDefaults.standard
 
     private struct ThirdPartyVIPNotice {
@@ -361,11 +369,13 @@ final class PlayerManager: NSObject, ObservableObject {
         isBuffering = true
         loadFailed = false
         pushHistory(song)
+        loadBluetoothLyricsIfNeeded()
         Task {
             var urlString: String?
             var resolvedThirdParty: UnblockService.Resolved?
+            var unblockFailure: UnblockFailure?
             // 版权受限歌手（周杰伦）：允许第三方音源，但启用严格模式（歌名+歌手+时长三重匹配原唱，校验不过拒绝，绝不播放翻唱）
-            // 免费听歌（灰色歌曲解锁）总开关：默认开启，优先使用内置预设音源兜底。
+            // 免费听歌（灰色歌曲解锁）总开关：默认开启，使用用户配置的第三方音源兜底。
             let enableUnblock = defaults.object(forKey: "beans.enableUnblock") as? Bool ?? true
             let strictUnlock = shouldLockOfficialOnly(song)
             let quality = BeansAudioQuality.current
@@ -373,16 +383,16 @@ final class PlayerManager: NSObject, ObservableObject {
             if song.source == .kugou {
                 urlString = try? await KugouMusicAPI.shared.songURL(song: song)
                 if urlString == nil {
-                    resolvedThirdParty = await kugouFallback(song: song, enableUnblock: enableUnblock)
+                    (resolvedThirdParty, unblockFailure) = await kugouFallback(song: song, enableUnblock: enableUnblock)
                 }
             } else if song.source == .qq, let mid = song.qqMid {
                 // 是否有播放权益以 vkey 实际返回为准；会员接口识别失败时也必须尝试官方地址。
                 urlString = try? await QQMusicAPI.shared.songURL(songmid: mid, mediaMid: song.qqMediaMid)
                 if urlString == nil {
-                    (urlString, resolvedThirdParty) = await qqFallback(song: song, quality: quality, enableUnblock: enableUnblock, strict: strictUnlock)
+                    (urlString, resolvedThirdParty, unblockFailure) = await qqFallback(song: song, quality: quality, enableUnblock: enableUnblock, strict: strictUnlock)
                 }
             } else {
-                (urlString, resolvedThirdParty) = await neteaseResolve(song: song, quality: quality, enableUnblock: enableUnblock, strict: strictUnlock)
+                (urlString, resolvedThirdParty, unblockFailure) = await neteaseResolve(song: song, quality: quality, enableUnblock: enableUnblock, strict: strictUnlock)
             }
             if let resolved = resolvedThirdParty {
                 let notice = self.thirdPartyVIPNotice(for: song, sourceTitle: resolved.sourceTitle)
@@ -393,18 +403,14 @@ final class PlayerManager: NSObject, ObservableObject {
                 return
             }
             guard let urlString, let url = URL(string: urlString) else {
-                let thirdPartyAttempted = resolvedThirdParty != nil
                 await MainActor.run {
                     guard generation == self.loadGeneration else { return }
                     self.isBuffering = false
                     self.loadFailed = true
-                    if song.source != .kugou, self.shouldLockOfficialOnly(song) {
-                        BeansLogger.shared.log("播放失败：\(song.name) - 未找到原唱音源（官方受限），拒绝翻唱版本", level: .error)
-                        ToastCenter.shared.show("《\(song.name)》未找到原唱音源（官方受限），已停止播放，拒绝翻唱版本")
-                    } else {
-                        let hint = thirdPartyAttempted ? "（第三方音源尝试后无结果）" : "（第三方音源未命中）"
-                        BeansLogger.shared.log("播放失败：\(song.name) - 无法解析播放地址\(hint)｜音质=\(quality.level) 免费听歌=\(enableUnblock ? "开" : "关")", level: .error)
-                    }
+                    // 提示必须如实反映失败原因：没配音源、音源不可用、严格校验拒绝是三件不同的事
+                    let reason = enableUnblock ? (unblockFailure?.userMessage ?? "未找到可用播放地址") : "免费听歌已关闭，官方无可用地址"
+                    BeansLogger.shared.log("播放失败：\(song.name) - \(reason)｜音质=\(quality.level) 免费听歌=\(enableUnblock ? "开" : "关") 官方受限=\(strictUnlock ? "是" : "否")", level: .error)
+                    ToastCenter.shared.show("《\(song.name)》\(reason)")
                 }
                 return
             }
@@ -416,9 +422,10 @@ final class PlayerManager: NSObject, ObservableObject {
     }
 
     /// 网易云播放地址解析：按设置音质取 URL，VIP/灰色歌曲交给第三方解锁（借鉴 Kumone）
-    private func neteaseResolve(song: Song, quality: BeansAudioQuality, enableUnblock: Bool, strict: Bool = false) async -> (String?, UnblockService.Resolved?) {
+    private func neteaseResolve(song: Song, quality: BeansAudioQuality, enableUnblock: Bool, strict: Bool = false) async -> (String?, UnblockService.Resolved?, UnblockFailure?) {
         var urlString: String?
         var resolved: UnblockService.Resolved?
+        var failure: UnblockFailure?
         let infos = try? await NetEaseAPI.shared.songURLInfo(ids: [song.id], level: quality.level)
         var info = infos?[song.id]
         if (info?.url == nil || info?.freeTrial == true), quality != .standard {
@@ -432,33 +439,40 @@ final class PlayerManager: NSObject, ObservableObject {
             urlString = u
         }
         if urlString == nil, enableUnblock {
-            resolved = await UnblockService.resolve(
+            let outcome = await UnblockService.resolve(
                 name: song.name,
                 artists: song.artists,
                 neteaseID: song.id,
                 songSource: .netease,
+                durationMS: Int(song.duration * 1000),
                 strict: strict
             )
+            resolved = outcome.resolved
+            failure = outcome.failure
         }
-        BeansLogger.shared.log("网易云结果：\(song.name) 官方=\(urlString != nil ? "是" : "否") 第三方=\(resolved != nil ? "命中" : "未用/未命中")", level: .debug)
-        return (urlString, resolved)
+        BeansLogger.shared.log("网易云结果：\(song.name) 官方=\(urlString != nil ? "是" : "否") 第三方=\(resolved != nil ? "命中" : failure?.userMessage ?? "未用")", level: .debug)
+        return (urlString, resolved, failure)
     }
 
     /// QQ 歌曲兜底：先在网易云按 歌名+歌手 匹配同名歌曲，免费完整 URL 直接播，VIP/无 URL 交给第三方解锁
-    private func qqFallback(song: Song, quality: BeansAudioQuality, enableUnblock: Bool, strict: Bool = false) async -> (String?, UnblockService.Resolved?) {
+    private func qqFallback(song: Song, quality: BeansAudioQuality, enableUnblock: Bool, strict: Bool = false) async -> (String?, UnblockService.Resolved?, UnblockFailure?) {
         var urlString: String?
         var resolved: UnblockService.Resolved?
+        var failure: UnblockFailure?
         if enableUnblock {
-            resolved = await UnblockService.resolve(
+            let outcome = await UnblockService.resolve(
                 name: song.name,
                 artists: song.artists,
                 neteaseID: 0,
                 songSource: .qq,
                 qqMid: song.qqMid,
+                durationMS: Int(song.duration * 1000),
                 strict: strict
             )
+            resolved = outcome.resolved
+            failure = outcome.failure
         }
-        if resolved != nil { return (nil, resolved) }
+        if resolved != nil { return (nil, resolved, nil) }
         if let matched = await matchNetEaseSong(name: song.name, artists: song.artists, durationMS: Int(song.duration * 1000), strict: strict) {
             let infos = try? await NetEaseAPI.shared.songURLInfo(ids: [matched.id], level: quality.level)
             var info = infos?[matched.id]
@@ -470,59 +484,68 @@ final class PlayerManager: NSObject, ObservableObject {
             if let u = info?.url, info?.freeTrial != true {
                 urlString = u
             } else if enableUnblock {
-                resolved = await UnblockService.resolve(
+                let outcome = await UnblockService.resolve(
                     name: matched.name,
                     artists: matched.artists,
                     neteaseID: matched.id,
                     songSource: .netease,
+                    durationMS: Int(song.duration * 1000),
                     strict: strict
                 )
+                resolved = outcome.resolved
+                failure = outcome.failure ?? failure
             }
         }
-        BeansLogger.shared.log("QQ兜底：\(song.name) 官方=\(urlString != nil ? "是" : "否") 第三方=\(resolved != nil ? "命中" : "未用/未命中")", level: .debug)
-        return (urlString, resolved)
+        BeansLogger.shared.log("QQ兜底：\(song.name) 官方=\(urlString != nil ? "是" : "否") 第三方=\(resolved != nil ? "命中" : failure?.userMessage ?? "未用")", level: .debug)
+        return (urlString, resolved, failure)
     }
 
-    /// 酷狗兜底：官方播放失败后使用内置音源作为备选。
-    private func kugouFallback(song: Song, enableUnblock: Bool) async -> UnblockService.Resolved? {
-        guard enableUnblock else { return nil }
+    /// 酷狗兜底：官方播放失败后使用第三方音源作为备选。
+    private func kugouFallback(song: Song, enableUnblock: Bool) async -> (UnblockService.Resolved?, UnblockFailure?) {
+        guard enableUnblock else { return (nil, nil) }
+        var failure: UnblockFailure?
+        let durationMS = Int(song.duration * 1000)
         let kugouID = song.kugouHash ?? song.kugouAlbumAudioId ?? ""
         if kugouID.isEmpty {
             BeansLogger.shared.log("酷狗兜底跳过：缺少 album_audio_id/hash", level: .debug)
+            failure = .missingIdentifier
         } else {
-            let resolved = await UnblockService.resolve(
+            let outcome = await UnblockService.resolve(
                 name: song.name,
                 artists: song.artists,
                 neteaseID: 0,
                 songSource: .kugou,
-                kugouID: kugouID
+                kugouID: kugouID,
+                durationMS: durationMS
             )
-            if let resolved {
+            if let resolved = outcome.resolved {
                 BeansLogger.shared.log("酷狗兜底：\(song.name) 酷狗音源=命中", level: .debug)
-                return resolved
+                return (resolved, nil)
             }
+            failure = outcome.failure
         }
 
         let strict = shouldLockOfficialOnly(song)
         if let matched = await matchNetEaseSong(
             name: song.name,
             artists: song.artists,
-            durationMS: Int(song.duration * 1000),
+            durationMS: durationMS,
             strict: strict
         ) {
-            let resolved = await UnblockService.resolve(
+            let outcome = await UnblockService.resolve(
                 name: matched.name,
                 artists: matched.artists,
                 neteaseID: matched.id,
                 songSource: .netease,
+                durationMS: durationMS,
                 strict: strict
             )
-            BeansLogger.shared.log("酷狗兜底转网易云音源：\(song.name) -> \(matched.name) 第三方=\(resolved != nil ? "命中" : "未命中")", level: .debug)
-            return resolved
+            BeansLogger.shared.log("酷狗兜底转网易云音源：\(song.name) -> \(matched.name) 第三方=\(outcome.resolved != nil ? "命中" : "未命中")", level: .debug)
+            return (outcome.resolved, outcome.resolved == nil ? (outcome.failure ?? failure) : nil)
         }
 
-        BeansLogger.shared.log("酷狗兜底：\(song.name) 第三方=未命中", level: .debug)
-        return nil
+        BeansLogger.shared.log("酷狗兜底：\(song.name) 第三方=\(failure?.userMessage ?? "未命中")", level: .debug)
+        return (nil, failure)
     }
 
     /// 版权受限歌手名单：这些歌手的歌曲必须严格校验原唱（第三方搜索会误匹配翻唱，如周杰伦）
@@ -598,11 +621,17 @@ final class PlayerManager: NSObject, ObservableObject {
         self.player = player
         playbackConfirmed = false
         itemStatusObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
-            guard let self, self.player === player, item.status == .failed else { return }
+            guard let self, self.player === player else { return }
+            guard item.status == .failed else { return }
             self.loadFailed = true
             self.isBuffering = false
             self.isPlaying = false
-            BeansLogger.shared.log("播放地址加载失败：\(item.error?.localizedDescription ?? "未知错误")", level: .error)
+            let reason = item.error?.localizedDescription ?? "未知错误"
+            BeansLogger.shared.log("播放地址加载失败：\(reason)｜域名=\(url.host ?? "?")", level: .error)
+            // 播放失败时给出提示，避免静默失败让用户不知发生了什么
+            DispatchQueue.main.async {
+                ToastCenter.shared.show("播放失败：\(reason)")
+            }
         }
         timeControlStatusObserver = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
             guard let self, self.player === player else { return }
@@ -629,6 +658,7 @@ final class PlayerManager: NSObject, ObservableObject {
                 if abs(time.seconds - self.lastPublishedProgress) >= 0.18 {
                     self.lastPublishedProgress = time.seconds
                     self.progress = time.seconds
+                    self.refreshBluetoothLyricsIfNeeded()
                 }
             }
             if let itemDuration = player.currentItem?.duration, itemDuration.isNumeric {
@@ -849,9 +879,10 @@ final class PlayerManager: NSObject, ObservableObject {
 
     private func updateNowPlaying() {
         guard let song = currentSong else { return }
+        let lyricText = bluetoothLyricsEnabled ? currentLyricText : nil
         var info: [String: Any] = [
-            MPMediaItemPropertyTitle: song.name,
-            MPMediaItemPropertyArtist: song.artists,
+            MPMediaItemPropertyTitle: lyricText ?? song.name,
+            MPMediaItemPropertyArtist: lyricText != nil ? song.name : song.artists,
             MPMediaItemPropertyAlbumTitle: song.album,
             MPMediaItemPropertyPlaybackDuration: max(duration, song.duration),
             MPNowPlayingInfoPropertyElapsedPlaybackTime: progress,
@@ -859,23 +890,35 @@ final class PlayerManager: NSObject, ObservableObject {
         ]
         if let artworkURL = song.coverURL {
             let artworkKey = song.identityKey + "|" + artworkURL.absoluteString
-            if let cached = Self.nowPlayingArtworkCache.object(forKey: artworkURL as NSURL) {
-                info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: cached.size) { _ in cached }
-            } else if lastNowPlayingArtworkKey != artworkKey {
+            if artworkKey != lastNowPlayingArtworkKey {
+                // 切歌：丢弃上一首的封面，重新拉取
                 lastNowPlayingArtworkKey = artworkKey
-                Task {
-                    if let data = try? Data(contentsOf: artworkURL), let image = UIImage(data: data) {
-                        Self.nowPlayingArtworkCache.setObject(image, forKey: artworkURL as NSURL)
-                        var updated = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
-                        updated[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
-                        MPNowPlayingInfoCenter.default().nowPlayingInfo = updated
-                    }
-                }
+                nowPlayingArtwork = nil
+                loadNowPlayingArtwork(from: artworkURL, key: artworkKey)
+            }
+            if let artwork = nowPlayingArtwork {
+                info[MPMediaItemPropertyArtwork] = artwork
             }
         } else {
             lastNowPlayingArtworkKey = nil
+            nowPlayingArtwork = nil
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+
+    /// 异步拉取封面，成功后持住并补写到当前锁屏信息
+    private func loadNowPlayingArtwork(from url: URL, key: String) {
+        Task { [weak self] in
+            guard let data = try? Data(contentsOf: url), let image = UIImage(data: data) else { return }
+            let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+            await MainActor.run {
+                guard let self, self.lastNowPlayingArtworkKey == key else { return }
+                self.nowPlayingArtwork = artwork
+                var updated = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+                updated[MPMediaItemPropertyArtwork] = artwork
+                MPNowPlayingInfoCenter.default().nowPlayingInfo = updated
+            }
+        }
     }
 
     private func setupRemoteCommands() {
@@ -927,6 +970,54 @@ final class PlayerManager: NSObject, ObservableObject {
             sessionConfigured = false
             configureAudioSession()
         }
+    }
+
+    // MARK: - 蓝牙歌词模式
+
+    var bluetoothLyricsEnabled: Bool {
+        defaults.object(forKey: Self.bluetoothLyricsKey) as? Bool ?? false
+    }
+
+    private var currentLyricText: String? {
+        guard let line = LyricFetcher.currentLine(in: bluetoothLyrics, progress: progress) else { return nil }
+        let text = line.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
+    }
+
+    func applyBluetoothLyricsPreference() {
+        if bluetoothLyricsEnabled {
+            loadBluetoothLyricsIfNeeded()
+        } else {
+            bluetoothLyrics = []
+            bluetoothLyricsSongKey = nil
+            pushedLyricText = nil
+            updateNowPlaying()
+        }
+    }
+
+    private func loadBluetoothLyricsIfNeeded() {
+        guard bluetoothLyricsEnabled, let song = currentSong else { return }
+        let key = song.identityKey
+        guard bluetoothLyricsSongKey != key else { return }
+        bluetoothLyricsSongKey = key
+        bluetoothLyrics = []
+        pushedLyricText = nil
+        Task { [weak self] in
+            let parsed = await LyricFetcher.load(for: song)
+            await MainActor.run {
+                guard self?.bluetoothLyricsSongKey == key else { return }
+                self?.bluetoothLyrics = parsed
+                self?.updateNowPlaying()
+            }
+        }
+    }
+
+    private func refreshBluetoothLyricsIfNeeded() {
+        guard bluetoothLyricsEnabled, !bluetoothLyrics.isEmpty else { return }
+        let text = currentLyricText
+        guard text != pushedLyricText else { return }
+        pushedLyricText = text
+        updateNowPlaying()
     }
 
 }
